@@ -1,0 +1,186 @@
+from dotenv import load_dotenv
+
+# Load .env variables before anything else
+load_dotenv()
+
+import streamlit as st
+import uuid
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.types import Command
+
+# Import agent factories
+from sql_agent import build_sql_agent
+from supervisor import app as supervisor_graph 
+
+# -----------------------------
+# Streamlit Configuration
+# -----------------------------
+st.set_page_config(page_title="Agentic Workspace", layout="wide")
+
+# Initialize Session States
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+if "sql_connected" not in st.session_state:
+    st.session_state.sql_connected = False
+if "db_url" not in st.session_state:
+    st.session_state.db_url = ""
+if "sql_graph" not in st.session_state:
+    st.session_state.sql_graph = None
+
+# -----------------------------
+# Sidebar
+# -----------------------------
+with st.sidebar:
+    st.title("Settings")
+    agent_choice = st.radio("Select Agent Mode", ["SQL Agent", "Supervisor Agent"])
+    st.divider()
+
+    if agent_choice == "SQL Agent":
+        st.subheader("Database Configuration")
+        db_url_input = st.text_input(
+            "Database Connection String",
+            value=st.session_state.db_url or "sqlite:///Chinook.db"
+        )
+
+        if st.button("Connect"):
+            try:
+                # Re-build the agent with the new URL
+                st.session_state.sql_graph = build_sql_agent(db_url_input)
+                st.session_state.db_url = db_url_input
+                st.session_state.sql_connected = True
+                st.success("Database connected!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Connection failed: {e}")
+
+# -----------------------------
+# Chat UI Rendering
+# -----------------------------
+st.title(f"{agent_choice}")
+
+# Display historical messages from session state
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+# -----------------------------
+# Chat Input & Processing
+# -----------------------------
+user_input = st.chat_input("Enter your request")
+
+if user_input:
+    # 1. Store and display user message
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # 2. Generate Assistant Response
+    with st.chat_message("assistant"):
+        if agent_choice == "SQL Agent":
+            if not st.session_state.sql_connected or st.session_state.sql_graph is None:
+                st.error("Please connect a database first.")
+            else:
+                final_response = ""
+                with st.status("Querying Database...", expanded=True) as status:
+                    # stream_mode="values" gives us the list of messages at each step
+                    for event in st.session_state.sql_graph.stream(
+                        {"messages": [HumanMessage(content=user_input)]},
+                        config,
+                        stream_mode="values",
+                    ):
+                        last_msg = event["messages"][-1]
+                        if isinstance(last_msg, AIMessage):
+                            if last_msg.tool_calls:
+                                status.write(f"🔧 Tool Call: {last_msg.tool_calls[0]['name']}")
+                            else:
+                                final_response = last_msg.content
+                    
+                    status.update(label="Complete", state="complete", expanded=False)
+                
+                # Display and Save the final response
+                if final_response:
+                    st.markdown(final_response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": final_response})
+                
+                # Check for interrupts immediately after streaming
+                st.rerun()
+
+        else:
+            # Supervisor Agent (Functional Implementation)
+            if supervisor_graph is None:
+                st.error("Supervisor Agent graph is not imported or defined.")
+            else:
+                with st.status("Supervisor routing task...", expanded=True) as status:
+                    final_response = ""
+                    # We use streaming to see the "thought process" of the supervisor
+                    for event in supervisor_graph.stream(
+                        {"messages": [HumanMessage(content=user_input)]},
+                        config,
+                        stream_mode="values",
+                    ):
+                        last_msg = event["messages"][-1]
+                        if isinstance(last_msg, AIMessage):
+                            if last_msg.tool_calls:
+                                # Show which sub-agent the supervisor is calling
+                                status.write(f"🤝 Delegating to: {last_msg.tool_calls[0]['name']}")
+                            else:
+                                final_response = last_msg.content
+                    
+                    status.update(label="Task Complete", state="complete", expanded=False)
+
+                if final_response:
+                    st.markdown(final_response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": final_response})
+
+# -----------------------------
+# Human-in-the-Loop (SQL)
+# -----------------------------
+if agent_choice == "SQL Agent" and st.session_state.sql_connected and st.session_state.sql_graph:
+    state = st.session_state.sql_graph.get_state(config)
+
+    # If the graph is waiting for human input (interrupt)
+    if state.next and state.tasks and state.tasks[0].interrupts:
+        interrupt_data = state.tasks[0].interrupts[0].value
+        
+        st.divider()
+        st.subheader("🛠️ SQL Review Required")
+        st.info("The agent needs your approval to run this query:")
+        st.code(interrupt_data["query"], language="sql")
+
+        edited_query = st.text_area("Edit query (optional):", value=interrupt_data["query"])
+        col1, col2, col3 = st.columns(3)
+
+        # ---------------------------------------------------------
+        # Helper to process the Command and update history
+        # ---------------------------------------------------------
+        def process_approval(command):
+            final_response = ""
+            # 1. Resume the graph with the specific command (accept/edit/reject)
+            for event in st.session_state.sql_graph.stream(command, config, stream_mode="values"):
+                last_msg = event["messages"][-1]
+                if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+                    final_response = last_msg.content
+            
+            # 2. Save the final response (even if it's a rejection message) to history
+            if final_response:
+                st.session_state.chat_history.append({"role": "assistant", "content": final_response})
+            
+            # 3. Force rerun to clear the interrupt UI and show the answer in chat
+            st.rerun()
+
+        with col1:
+            if st.button("✅ Approve & Run", use_container_width=True):
+                process_approval(Command(resume={"type": "accept"}))
+            
+        with col2:
+            if st.button("📝 Run Edited Query", use_container_width=True):
+                process_approval(Command(resume={"type": "edit", "query": edited_query}))
+            
+        with col3:
+            if st.button("❌ Reject", use_container_width=True):
+                # This moves the graph to the 'answer' node with a 'rejected' status
+                process_approval(Command(resume={"type": "reject"}))

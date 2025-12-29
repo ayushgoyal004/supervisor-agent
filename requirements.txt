@@ -1,0 +1,8 @@
+langchain
+langchain[google-genai]
+dotenv
+langgraph
+langchain-community
+ipython
+streamlit
+langchain-openai
