@@ -18,6 +18,8 @@ from supervisor import app as supervisor_graph
 st.set_page_config(page_title="Agentic Workspace", layout="wide")
 
 # Initialize Session States
+if "user_id" not in st.session_state:
+    st.session_state.user_id = "default_user_123" # Or str(uuid.uuid4())
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "thread_id" not in st.session_state:
@@ -32,9 +34,44 @@ if "sql_graph" not in st.session_state:
 # -----------------------------
 # Sidebar
 # -----------------------------
+# with st.sidebar:
+#     st.title("Settings")
+#     agent_choice = st.radio("Select Agent Mode", ["SQL Agent", "Supervisor Agent"])
+#     st.divider()
+#     if agent_choice == "SQL Agent":
+#         st.subheader("Database Configuration")
+#         db_url_input = st.text_input(
+#             "Database Connection String",
+#             value=st.session_state.db_url or "sqlite:///Chinook.db"
+#         )
+
+#         if st.button("Connect"):
+#             try:
+#                 # Re-build the agent with the new URL
+#                 st.session_state.sql_graph = build_sql_agent(db_url_input)
+#                 st.session_state.db_url = db_url_input
+#                 st.session_state.sql_connected = True
+#                 st.success("Database connected!")
+#                 st.rerun()
+#             except Exception as e:
+#                 st.error(f"Connection failed: {e}")
+
+# -----------------------------
+# Sidebar
+# -----------------------------
 with st.sidebar:
     st.title("Settings")
     agent_choice = st.radio("Select Agent Mode", ["SQL Agent", "Supervisor Agent"])
+    st.divider()
+
+    # 1. User Identity (Crucial for Long-Term Memory)
+    st.subheader("User Profile")
+    user_id = st.text_input("User ID", value=st.session_state.get("user_id", "default_user"))
+    if user_id != st.session_state.get("user_id"):
+        st.session_state.user_id = user_id
+        # We don't necessarily need to rerun, but it ensures config is updated
+        st.rerun()
+
     st.divider()
 
     if agent_choice == "SQL Agent":
@@ -46,7 +83,7 @@ with st.sidebar:
 
         if st.button("Connect"):
             try:
-                # Re-build the agent with the new URL
+                # build_sql_agent now returns a compiled graph with an internal Store
                 st.session_state.sql_graph = build_sql_agent(db_url_input)
                 st.session_state.db_url = db_url_input
                 st.session_state.sql_connected = True
@@ -54,6 +91,33 @@ with st.sidebar:
                 st.rerun()
             except Exception as e:
                 st.error(f"Connection failed: {e}")
+
+        # 2. Memory Visualization
+        if st.session_state.sql_connected and st.session_state.sql_graph:
+            st.divider()
+            st.subheader("🧠 Long-Term Memory")
+            
+            # Access the store from the compiled graph
+            store = st.session_state.sql_graph.store
+            # Search for memories in the specific user's namespace
+            memories = store.search(("memories", st.session_state.user_id))
+            
+            if memories:
+                for m in memories:
+                    with st.expander(f"💡 {m.value['preference'][:30]}..."):
+                        st.write(f"**Preference:** {m.value['preference']}")
+                        st.caption(f"**Context:** {m.value['context']}")
+                
+                if st.button("🗑️ Clear All Memories"):
+                    # Delete each memory in the namespace
+                    for m in memories:
+                        store.delete(("memories", st.session_state.user_id), m.key)
+                    st.toast("Memories cleared!")
+                    st.rerun()
+            else:
+                st.info("The agent hasn't saved any user preferences yet.")
+    
+
 
 # -----------------------------
 # Chat UI Rendering
@@ -65,7 +129,11 @@ for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-config = {"configurable": {"thread_id": st.session_state.thread_id}}
+config = {"configurable": 
+          {"thread_id": st.session_state.thread_id,
+            "user_id": st.session_state.user_id
+            }
+        }
 
 # -----------------------------
 # Chat Input & Processing
@@ -94,8 +162,16 @@ if user_input:
                     ):
                         last_msg = event["messages"][-1]
                         if isinstance(last_msg, AIMessage):
+                            # if last_msg.tool_calls:
+                            #     status.write(f"🔧 Tool Call: {last_msg.tool_calls[0]['name']}")
                             if last_msg.tool_calls:
-                                status.write(f"🔧 Tool Call: {last_msg.tool_calls[0]['name']}")
+                                t_name = last_msg.tool_calls[0]['name']
+                                # Add specific feedback for memory saving
+                                if t_name == "save_user_preference":
+                                    status.write(f"🧠 Learning preference: {last_msg.tool_calls[0]['args'].get('preference')}")
+                                else:
+                                    status.write(f"🔧 Tool Call: {t_name}")
+                            
                             else:
                                 final_response = last_msg.content
                     
