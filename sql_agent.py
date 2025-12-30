@@ -528,7 +528,11 @@ def build_sql_agent(db_url: str):
         2. Max results: 5. SELECT only.
         """)
 
-        llm_with_tools = model.bind_tools([run_query_with_interrupt, upsert_user_memory,clear_all_memories])
+        # llm_with_tools = model.bind_tools([run_query_with_interrupt, upsert_user_memory,clear_all_memories])
+        llm_with_tools = model.bind_tools([
+                        run_query_with_interrupt
+                    ])
+
         return {"messages": [llm_with_tools.invoke([system_msg] + state["messages"])]}
 
     def answer_node(state: MessagesState):
@@ -543,7 +547,7 @@ def build_sql_agent(db_url: str):
     builder.add_node("get_schema_tool_node", ToolNode([get_schema_tool]))
     builder.add_node("generate_query", generate_query_node)
     builder.add_node("run_query", ToolNode([run_query_with_interrupt]))
-    builder.add_node("memory_node", ToolNode([upsert_user_memory,clear_all_memories]))
+    # builder.add_node("memory_node", ToolNode([upsert_user_memory,clear_all_memories]))
     builder.add_node("answer", answer_node)
     builder.add_node("automatic_memory", automatic_memory_node) # NEW NODE
 
@@ -552,20 +556,36 @@ def build_sql_agent(db_url: str):
     builder.add_edge("schema_node", "get_schema_tool_node")
     builder.add_edge("get_schema_tool_node", "generate_query")
 
+    # def route_next(state: MessagesState):
+    #     last = state["messages"][-1]
+    #     if not last.tool_calls: return "answer"
+    #     t_name = last.tool_calls[0]["name"]
+    #     if t_name == "run_query_with_interrupt": return "run_query"
+    #     # if t_name == "upsert_user_memory": return "memory_node"
+    #     if t_name in ["upsert_user_memory", "clear_all_memories"]: 
+    #         return "memory_node"
+    #     return "get_schema_tool_node"
     def route_next(state: MessagesState):
         last = state["messages"][-1]
-        if not last.tool_calls: return "answer"
-        t_name = last.tool_calls[0]["name"]
-        if t_name == "run_query_with_interrupt": return "run_query"
-        # if t_name == "upsert_user_memory": return "memory_node"
-        if t_name in ["upsert_user_memory", "clear_all_memories"]: 
+
+        if not last.tool_calls:
+            return "answer"
+
+        tool_name = last.tool_calls[0]["name"]
+
+        if tool_name in ["upsert_user_memory", "clear_all_memories"]:
             return "memory_node"
+
+        if tool_name == "run_query_with_interrupt":
+            return "run_query"
+
         return "get_schema_tool_node"
+
 
     builder.add_conditional_edges("generate_query", route_next)
     
     # Pathing for memory and completion
-    builder.add_edge("memory_node", "answer") 
+    # builder.add_edge("memory_node", "answer") 
     builder.add_edge("run_query", "answer")
     builder.add_edge("answer", "automatic_memory") # Answer flows to memory extraction
     builder.add_edge("automatic_memory", END)
