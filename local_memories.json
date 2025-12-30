@@ -7,6 +7,14 @@
         "8178f60d-f33d-4452-9a5f-01415ca1169f": {
             "content": "Alice",
             "topic": "name"
+        },
+        "2c1be275-e5df-4e11-b598-c2aeee4d9149": {
+            "content": "Limit results to top 5 rows only.",
+            "topic": "results_limit"
+        },
+        "12b6fc01-7137-40e0-9e96-f007f204f46b": {
+            "content": "uppercase",
+            "topic": "SQL keywords"
         }
     }
 }

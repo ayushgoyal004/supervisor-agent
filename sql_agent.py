@@ -452,27 +452,48 @@ def build_sql_agent(db_url: str):
         existing_memories = store.search(namespace)
         memory_context = "\n".join([f"ID: {m.key} | {m.value['topic']}: {m.value['content']}" for m in existing_memories])
 
+        # extraction_prompt = f"""
+        # You are a memory management module. Review the latest exchange and determine if there is 
+        # information worth remembering for long-term SQL assistance.
+
+        # Current Memories:
+        # {memory_context}
+
+        # Latest Exchange:
+        # User: {state['messages'][-2].content if len(state['messages']) > 1 else ""}
+        # AI: {state['messages'][-1].content}
+
+        # Rules:
+        # 1. If the user expresses a preference (e.g., "Always use LIMIT 10", "I prefer snake_case"), SAVE/UPDATE it.
+        # 2. If the user corrects a previous preference, UPDATE it.
+        # 3. If a memory is no longer true, DELETE it.
+        # 4. If no new information is present, return "SKIP".
+
+        # Response format: ACTION|TOPIC|CONTENT|ID (ID only for Update/Delete)
+        # Example: UPDATE|formatting|Use uppercase SQL keywords|123-abc
+        # Example: SAVE|db_pref|User is working with a production schema|None
+        # """
+        last_user = next(
+            (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+            ""
+        )
+        last_ai = next(
+            (m.content for m in reversed(state["messages"]) if isinstance(m, AIMessage)),
+            ""
+        )
+
         extraction_prompt = f"""
-        You are a memory management module. Review the latest exchange and determine if there is 
-        information worth remembering for long-term SQL assistance.
+        User said:
+        {last_user}
 
-        Current Memories:
-        {memory_context}
+        Assistant replied:
+        {last_ai}
 
-        Latest Exchange:
-        User: {state['messages'][-2].content if len(state['messages']) > 1 else ""}
-        AI: {state['messages'][-1].content}
-
-        Rules:
-        1. If the user expresses a preference (e.g., "Always use LIMIT 10", "I prefer snake_case"), SAVE/UPDATE it.
-        2. If the user corrects a previous preference, UPDATE it.
-        3. If a memory is no longer true, DELETE it.
-        4. If no new information is present, return "SKIP".
-
-        Response format: ACTION|TOPIC|CONTENT|ID (ID only for Update/Delete)
-        Example: UPDATE|formatting|Use uppercase SQL keywords|123-abc
-        Example: SAVE|db_pref|User is working with a production schema|None
+        Extract at most ONE long-term preference if present.
+        If none, return SKIP.
+        Respond as: SAVE|topic|content
         """
+
 
         res = model.invoke(extraction_prompt).content
         if res == "SKIP":
@@ -513,9 +534,16 @@ def build_sql_agent(db_url: str):
     def schema_node(state: MessagesState):
         return {"messages": [model.bind_tools([get_schema_tool]).invoke(state["messages"])]}
 
+
+    def get_relevant_memory(store, user_id, max_items=3):
+        memories = store.search(("memories", user_id))
+        return memories[:max_items]
+
+
     def generate_query_node(state: MessagesState, config: RunnableConfig, store: BaseStore):
         user_id = config["configurable"].get("user_id", "default_user")
-        memories = store.search(("memories", user_id))
+        # memories = store.search(("memories", user_id))
+        memories = get_relevant_memory(store, user_id)
         
         memory_str = "\n".join(
             [f"- {m.value['topic'].upper()}: {m.value['content']}" for m in memories]
@@ -525,7 +553,7 @@ def build_sql_agent(db_url: str):
         SQL expert for {db.dialect}.
         USER MEMORY: {memory_str}
         1. Tailor queries based on memory.
-        2. Max results: 5. SELECT only.
+        2. Follow user preferences if present.SELECT only.
         """)
 
         # llm_with_tools = model.bind_tools([run_query_with_interrupt, upsert_user_memory,clear_all_memories])
@@ -538,6 +566,21 @@ def build_sql_agent(db_url: str):
     def answer_node(state: MessagesState):
         system_msg = SystemMessage(content="Explain results clearly.")
         return {"messages": [model.invoke([system_msg] + state["messages"])]}
+    
+
+    def prune_messages(state: MessagesState):
+        msgs = state["messages"]
+
+        # Keep last 4 conversational messages only
+        kept = []
+        for m in reversed(msgs):
+            if isinstance(m, (HumanMessage, AIMessage)):
+                kept.append(m)
+            if len(kept) == 4:
+                break
+
+        return {"messages": list(reversed(kept))}
+
 
     # --- Graph Construction ---
     builder = StateGraph(MessagesState)
@@ -550,6 +593,7 @@ def build_sql_agent(db_url: str):
     # builder.add_node("memory_node", ToolNode([upsert_user_memory,clear_all_memories]))
     builder.add_node("answer", answer_node)
     builder.add_node("automatic_memory", automatic_memory_node) # NEW NODE
+    builder.add_node("prune", prune_messages)
 
     builder.add_edge(START, "list_tables")
     builder.add_edge("list_tables", "schema_node")
@@ -573,8 +617,8 @@ def build_sql_agent(db_url: str):
 
         tool_name = last.tool_calls[0]["name"]
 
-        if tool_name in ["upsert_user_memory", "clear_all_memories"]:
-            return "memory_node"
+        # if tool_name in ["upsert_user_memory", "clear_all_memories"]:
+        #     return "memory_node"
 
         if tool_name == "run_query_with_interrupt":
             return "run_query"
@@ -588,7 +632,9 @@ def build_sql_agent(db_url: str):
     # builder.add_edge("memory_node", "answer") 
     builder.add_edge("run_query", "answer")
     builder.add_edge("answer", "automatic_memory") # Answer flows to memory extraction
-    builder.add_edge("automatic_memory", END)
+    builder.add_edge("automatic_memory", "prune")
+    builder.add_edge("prune", END)
+    # builder.add_edge("automatic_memory", END)
 
     # Initialize Long-Term Store
     long_term_store = InMemoryStore()
